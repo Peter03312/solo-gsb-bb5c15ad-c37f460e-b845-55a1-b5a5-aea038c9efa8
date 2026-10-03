@@ -40,6 +40,25 @@ CREATE TABLE IF NOT EXISTS capacity_controls (
     capacity     INTEGER NOT NULL
 );
 
+-- 烟雾暴露时段：左闭右开 [start_minute, end_minute)，时段内该通道每被
+-- 占用一分钟即向在途组计入 exposure（非负整数）；同一通道的时段互不
+-- 重叠，未登记的分钟暴露为零，节点等待不计入。
+CREATE TABLE IF NOT EXISTS smoke_exposures (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    edge_id      INTEGER NOT NULL,
+    start_minute INTEGER NOT NULL,
+    end_minute   INTEGER NOT NULL,
+    exposure     INTEGER NOT NULL
+);
+
+-- 人群组非负累计烟雾暴露上限：仅登记过上限的组有行（未设上限的组不受
+-- 暴露约束）。节点滞留改编时已走前缀按原计划时刻计算暴露，余程只使用
+-- 剩余额度。
+CREATE TABLE IF NOT EXISTS group_smoke_limits (
+    group_id     INTEGER PRIMARY KEY,
+    smoke_limit  INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS groups (
     id                 INTEGER PRIMARY KEY,
     size               INTEGER NOT NULL,
@@ -178,6 +197,7 @@ CREATE TABLE IF NOT EXISTS revisions (
     rev         INTEGER PRIMARY KEY,  -- 全局递增修订号（按实际提交顺序）
     operation   TEXT NOT NULL,        -- scenario | groups | group-corrections |
                                       -- closures | capacity-controls |
+                                      -- smoke-exposures | group-smoke-limits |
                                       -- group-prerequisites |
                                       -- delay-reports | rescue-dispatches |
                                       -- rescue-completions | tick
@@ -203,13 +223,16 @@ async def reset_db(db: aiosqlite.Connection) -> None:
     修订号继续全局递增。
     """
     # 人工救援队与其救援任务随场景重置清空；先导关系与出口清点记录（含更正
-    # 历史）亦清空；逐段实际通行核报记录同样清空；修订历史不在清空之列
+    # 历史）亦清空；逐段实际通行核报记录同样清空；本场烟雾暴露时段与各组
+    # 暴露上限一并清空；修订历史不在清空之列
     for table in ("rescue_tasks", "rescue_teams",
                   "delay_reports", "group_prerequisites",
                   "exit_count_corrections", "exit_counts",
                   "traversal_reports",
                   "route_steps", "groups", "closures",
-                  "capacity_controls", "exits", "edges", "meta"):
+                  "capacity_controls", "smoke_exposures",
+                  "group_smoke_limits",
+                  "exits", "edges", "meta"):
         await db.execute(f"DELETE FROM {table}")
     await db.execute(
         "INSERT INTO meta(key, value) VALUES('current_minute', 0)")
@@ -276,6 +299,23 @@ async def load_world(db: aiosqlite.Connection):
         for edge_id, a, b, cap in await cur.fetchall():
             capacity_controls.setdefault(edge_id, []).append((a, b, cap))
 
+    # 烟雾暴露时段：edge_id -> 按开始分钟升序、互不重叠的
+    # [(a, b, 每分钟暴露值), ...]
+    smoke_windows: dict[int, list[tuple[int, int, int]]] = {}
+    async with db.execute(
+            """SELECT edge_id, start_minute, end_minute, exposure
+               FROM smoke_exposures
+               ORDER BY edge_id, start_minute""") as cur:
+        for edge_id, a, b, value in await cur.fetchall():
+            smoke_windows.setdefault(edge_id, []).append((a, b, value))
+
+    # 各组非负累计暴露上限：未登记的组不受约束（字典中缺省）
+    smoke_limits: dict[int, int] = {}
+    async with db.execute(
+            "SELECT group_id, smoke_limit FROM group_smoke_limits") as cur:
+        for gid, limit in await cur.fetchall():
+            smoke_limits[gid] = int(limit)
+
     # 已固定（已出发）组的占用：仅计当前分钟起尚未走完的部分
     minute_now = await get_current_minute(db)
     fixed_load: dict[tuple[int, int], int] = {}
@@ -292,7 +332,8 @@ async def load_world(db: aiosqlite.Connection):
 
     world = World(edges=edges, adjacency=adjacency, exits=exits,
                   closures=closures, fixed_load=fixed_load,
-                  capacity_controls=capacity_controls)
+                  capacity_controls=capacity_controls,
+                  smoke_windows=smoke_windows)
 
     async with db.execute(
             """SELECT id, size, origin, earliest_departure, priority,
@@ -305,6 +346,8 @@ async def load_world(db: aiosqlite.Connection):
             ("id", "size", "origin", "earliest_departure",
              "priority", "deadline", "status"),
             row)) for row in await cur.fetchall()]
+    for g in pending:
+        g["smoke_limit"] = smoke_limits.get(g["id"])
 
     # 全部组当前状态 + 先导到达锚点（规划到达 / 人工实际送达）。未出发组
     # 的先导若是 scheduled/failed/blocked 或 pending，会在本轮多轮安排中
@@ -391,6 +434,54 @@ async def persist_replan(db: aiosqlite.Connection, results: list[dict],
                        departure_minute=NULL, arrival_minute=NULL, exit_id=NULL,
                        fail_reason=?, fail_detail=? WHERE id=?""",
                     (r["reason"], r["detail"], gid))
+
+
+# --------------------------------------------------------------------------
+# 烟雾暴露时段与人群组累计暴露上限
+# --------------------------------------------------------------------------
+
+async def insert_smoke_exposure(db: aiosqlite.Connection, *, edge_id: int,
+                                start_minute: int, end_minute: int,
+                                exposure: int) -> None:
+    """登记一条按通道的烟雾暴露时段（调用方负责事务与全部校验）。"""
+    await db.execute(
+        """INSERT INTO smoke_exposures
+           (edge_id, start_minute, end_minute, exposure)
+           VALUES(?,?,?,?)""",
+        (edge_id, start_minute, end_minute, exposure))
+
+
+async def load_smoke_exposures(db: aiosqlite.Connection
+                               ) -> dict[int, list[tuple[int, int, int]]]:
+    """返回 edge_id -> 按开始分钟升序、互不重叠的烟雾时段
+    [(a, b, 每分钟暴露值), ...]。"""
+    result: dict[int, list[tuple[int, int, int]]] = {}
+    async with db.execute(
+            """SELECT edge_id, start_minute, end_minute, exposure
+               FROM smoke_exposures
+               ORDER BY edge_id, start_minute""") as cur:
+        for edge_id, a, b, value in await cur.fetchall():
+            result.setdefault(edge_id, []).append((a, b, int(value)))
+    return result
+
+
+async def upsert_group_smoke_limit(db: aiosqlite.Connection, *,
+                                   group_id: int, smoke_limit: int) -> None:
+    """为一组登记/替换非负累计暴露上限（调用方负责事务与全部校验）。"""
+    await db.execute(
+        """INSERT INTO group_smoke_limits(group_id, smoke_limit)
+           VALUES(?,?)
+           ON CONFLICT(group_id) DO UPDATE SET
+               smoke_limit=excluded.smoke_limit""",
+        (group_id, smoke_limit))
+
+
+async def load_group_smoke_limits(db: aiosqlite.Connection
+                                  ) -> dict[int, int]:
+    """返回 group_id -> 非负累计暴露上限（仅登记过上限的组）。"""
+    async with db.execute(
+            "SELECT group_id, smoke_limit FROM group_smoke_limits") as cur:
+        return {gid: int(limit) for gid, limit in await cur.fetchall()}
 
 
 # --------------------------------------------------------------------------

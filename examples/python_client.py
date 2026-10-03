@@ -531,6 +531,82 @@ if __name__ == "__main__":
     print("  失效留痕：", [(r["report_id"], r["seq"], r["detach_reason"])
                         for r in payload["detached_reports"]])
 
+    # ---- 烟雾暴露时段与各组累计暴露上限 ----
+    status, plan = call("POST", "/scenario", {
+        "passages": [
+            {"id": 1, "src": 1, "dst": 2, "minutes": 4, "capacity": 10},
+            {"id": 2, "src": 2, "dst": 6, "minutes": 2, "capacity": 10},
+        ],
+        "exits": [5, 6], "closures": [],
+        "groups": [
+            {"id": 1, "size": 5, "origin": 1, "earliest_departure": 0,
+             "priority": 10, "deadline": 30},
+            {"id": 2, "size": 5, "origin": 1, "earliest_departure": 0,
+             "priority": 5, "deadline": 30},
+        ],
+    })
+    assert status == 200
+
+    # 为未出发组1登记非负累计暴露上限5（未设上限的组2不受约束）
+    status, plan = call("POST", "/group-smoke-limits",
+                        {"group_id": 1, "smoke_limit": 5})
+    show("为组1登记累计暴露上限5（再登记替换）", status, plan)
+    # 通道1 第0..4分钟每分钟暴露1；通道2 第4..6分钟暴露2：
+    # 组1 全程4+2=6 > 5，在节点2等到第6分钟进入（等待不计暴露），到达8
+    call("POST", "/smoke-exposures",
+         {"edge_id": 1, "start_minute": 0, "end_minute": 4, "exposure": 1})
+    status, plan = call("POST", "/smoke-exposures",
+                        {"edge_id": 2, "start_minute": 4,
+                         "end_minute": 6, "exposure": 2})
+    show("登记烟雾时段（组1等待消散后通行；组2无上限照常通行）",
+         status, plan)
+    summarize(plan)
+    for g in plan["groups"]:
+        print(f"  组 {g['group_id']}：上限 {g['smoke_limit']}，"
+              f"前缀已用 {g['smoke_prefix_exposure']}，"
+              f"余程预计 {g['smoke_remaining_exposure']}")
+
+    status, payload = call("GET", "/smoke-exposures")
+    show("列出全部烟雾暴露时段", status, payload)
+    status, payload = call("GET", "/group-smoke-limits")
+    show("列出各组累计暴露上限", status, payload)
+
+    # 无效登记：起点早于当前分钟 422；同通道重叠 409
+    status, payload = call("POST", "/smoke-exposures",
+                           {"edge_id": 1, "start_minute": 0,
+                            "end_minute": 2, "exposure": 1})
+    show("起点早于当前分钟（预期 422）", status, payload)
+    status, payload = call("POST", "/smoke-exposures",
+                           {"edge_id": 2, "start_minute": 5,
+                            "end_minute": 8, "exposure": 1})
+    show("同通道时段重叠（预期 409 SMOKE_EXPOSURE_OVERLAP）",
+         status, payload)
+
+    # 推进后两组固定；新时段使已出发组固定路线预计累计暴露超限 -> 409
+    call("POST", "/tick", {"minutes": 5})
+    status, payload = call("POST", "/smoke-exposures",
+                           {"edge_id": 2, "start_minute": 6,
+                            "end_minute": 10, "exposure": 3})
+    show("使已出发组固定路线累计暴露超限（预期 409，附超限分钟）",
+         status, payload)
+    # 已出发组不可再登记上限
+    status, payload = call("POST", "/group-smoke-limits",
+                           {"group_id": 1, "smoke_limit": 99})
+    show("为已出发组登记上限（预期 409 GROUP_ALREADY_DEPARTED）",
+         status, payload)
+
+    # 节点滞留改编：保留已走前缀暴露（通道1=4），只用剩余额度1寻找余程；
+    # 通道2 [8,30) 每分钟1，第6分钟恢复时走[6,8)暴露0仍可行
+    call("POST", "/smoke-exposures",
+         {"edge_id": 2, "start_minute": 8, "end_minute": 30, "exposure": 1})
+    status, plan = call("POST", "/groups/1/delay-report",
+                        {"node_id": 2, "recovery_minute": 6})
+    show("节点2滞留、第6分钟恢复（前缀暴露保留，剩余额度内重找余程）",
+         status, plan)
+    g1 = next(g for g in plan["groups"] if g["group_id"] == 1)
+    print(f"  前缀已用 {g1['smoke_prefix_exposure']}（上限5），"
+          f"余程预计 {g1['smoke_remaining_exposure']}")
+
     # ---- 修订历史：追溯每次编排变更 ----
     status, payload = call("GET", "/revisions")
     show("修订列表（每次成功变更一条，拒绝不产生）", status, payload)

@@ -13,6 +13,11 @@
 * 容量管制：可为通道登记左闭右开的管制时段 ``[a, b)`` 及时段内每分钟
   上限；同一通道的管制时段互不重叠。管制时段内有效上限取
   ``min(原容量, 管制上限)``（管制只收紧不放松），时段外仍为原容量。
+* 烟雾暴露：可按通道登记左闭右开的烟雾暴露时段 ``[a, b)`` 及时段内每
+  分钟暴露值（非负）；同一通道的时段互不重叠，未登记的分钟暴露为零。
+  通道被占用的每分钟向在途组计入该分钟暴露值，节点等待不计入。设有
+  非负累计暴露上限的组，其全程累计暴露不得超过上限；编排可在节点等待
+  烟雾消散后通行。未设上限的组不受此约束。
 
 择优规则
 --------
@@ -53,6 +58,10 @@ class World:
     # edge_id -> 已按开始分钟升序排列、互不重叠的 [(a, b, 时段内上限), ...]
     capacity_controls: dict[int, list[tuple[int, int, int]]] = \
         field(default_factory=dict)
+    # edge_id -> 已按开始分钟升序排列、互不重叠的
+    # [(a, b, 时段内每分钟暴露值), ...]；未登记的分钟暴露为 0
+    smoke_windows: dict[int, list[tuple[int, int, int]]] = \
+        field(default_factory=dict)
 
 
 class PlanningError(Exception):
@@ -75,6 +84,26 @@ def effective_capacity(base_capacity: int,
     return base_capacity
 
 
+def minute_exposure(windows: list[tuple[int, int, int]] | tuple,
+                    minute: int) -> int:
+    """通道某分钟的烟雾暴露值：登记时段内取该时段暴露值，未登记为 0。
+
+    ``windows`` 需按开始分钟升序且互不重叠。
+    """
+    for a, b, value in windows:
+        if a > minute:
+            break
+        if minute < b:
+            return value
+    return 0
+
+
+def interval_exposure(windows: list[tuple[int, int, int]] | tuple,
+                      start: int, end: int) -> int:
+    """通道在左闭右开区间 [start, end) 内逐分钟暴露值之和。"""
+    return sum(minute_exposure(windows, m) for m in range(start, end))
+
+
 def _dominates(a_time: int, a_seq: tuple[int, ...],
                b_time: int, b_seq: tuple[int, ...]) -> bool:
     """标签 a 是否支配标签 b：到达不晚且通道序列字典序不更大。"""
@@ -83,12 +112,15 @@ def _dominates(a_time: int, a_seq: tuple[int, ...],
 
 def earliest_entry(edge: Edge, start: int, size: int, world: World,
                    horizon: int, *, use_closures: bool,
-                   use_loads: bool) -> Optional[int]:
+                   use_loads: bool, smoke_budget: int | None = None,
+                   smoke_used: int = 0) -> Optional[int]:
     """返回最早的可进入分钟 t >= start，使 [t, t+w) 完全可用。
 
     不可用包括：与封闭时段相交、某一分钟占用达到该分钟有效上限（容量
-    管制时段内为 min(原容量, 管制上限)）。均不满足（或无法在 horizon
-    前完成通行）时返回 None。
+    管制时段内为 min(原容量, 管制上限)）、累计烟雾暴露超过该组非负
+    上限（``smoke_budget`` 为 None 时不约束；``smoke_used`` 为抵达该
+    节点前已经累计的暴露）。均不满足（或无法在 horizon 前完成通行）
+    时返回 None。
     """
     eid = edge.id
     w = edge.minutes
@@ -96,6 +128,7 @@ def earliest_entry(edge: Edge, start: int, size: int, world: World,
     if t + w > horizon:
         return None
     closures = world.closures.get(eid, ())
+    smoke_windows = world.smoke_windows.get(eid, ())
     while t + w <= horizon:
         advanced = False
         if use_closures:
@@ -131,94 +164,136 @@ def earliest_entry(edge: Edge, start: int, size: int, world: World,
                     break
             if advanced:
                 continue
+        if smoke_budget is not None:
+            # 累计暴露只看通道占用的每一分钟：[t, t+w) 的暴露值之和
+            accumulated = smoke_used
+            for minute in range(t, t + w):
+                value = minute_exposure(smoke_windows, minute)
+                if accumulated + value > smoke_budget:
+                    if value == 0:
+                        # 防御：零值不可能导致超限；此处不可达
+                        t = minute + 1
+                    elif value > smoke_budget - accumulated:
+                        # 该分钟单分钟暴露即超剩余额度：整个登记时段内
+                        # 额度都不可能恢复（暴露非负），跳到该时段结束分钟
+                        t = next(
+                            (b for a, b, _v in smoke_windows
+                             if a <= minute < b), minute + 1)
+                    else:
+                        # 该分钟进入会累计超限；下一分钟再尝试
+                        t = minute + 1
+                    advanced = True
+                    break
+                accumulated += value
+            if advanced:
+                continue
         return t
     return None
 
 
 def _search(world: World, *, origin: int, size: int, start: int,
-            horizon: int, use_closures: bool, use_loads: bool
-            ) -> dict[int, tuple[int, tuple[int, ...]]]:
+            horizon: int, use_closures: bool, use_loads: bool,
+            smoke_budget: int | None = None
+            ) -> dict[int, tuple[int, tuple[int, ...], int]]:
     """多标签时变 Dijkstra。
 
-    返回每个可达出口的最优标签 (最早到达分钟, 对应通道编号序列)。
-    通道序列只取最早到达下字典序最小者；路径不允许重复经过节点
-    （疏散路径无需绕环，同时保证标签集有限）。
-    """
-    # node -> [(arrival, seq), ...] Pareto 标签集
-    labels: dict[int, list[tuple[int, tuple[int, ...]]]] = {}
-    heap: list[tuple[int, tuple[int, ...], int, frozenset[int]]] = []
+    返回每个可达出口的最优标签 (最早到达分钟, 对应通道编号序列, 该路线
+    累计烟雾暴露)。通道序列只取最早到达下字典序最小者；路径不允许重复
+    经过节点（疏散路径无需绕环，同时保证标签集有限）。
 
-    labels[origin] = [(start, ())]
-    heapq.heappush(heap, (start, (), origin, frozenset({origin})))
+    标签 (到达, 序列, 累计暴露) 按"到达不晚、序列字典序不更大且累计
+    暴露不更高"做 Pareto 支配；同序列标签的暴露唯一，故不影响原有
+    到达/序列并列口径。设有暴露上限时累计暴露不得超过上限。
+    """
+    # node -> [(arrival, seq, exposure), ...] Pareto 标签集
+    labels: dict[int, list[tuple[int, tuple[int, ...], int]]] = {}
+    heap: list[tuple[int, tuple[int, ...], int, int, frozenset[int]]] = []
+
+    labels[origin] = [(start, (), 0)]
+    heapq.heappush(heap, (start, (), origin, 0, frozenset({origin})))
 
     while heap:
-        arrive, seq, node, visited = heapq.heappop(heap)
+        arrive, seq, node, exposure, visited = heapq.heappop(heap)
         current = labels.get(node, [])
-        if (arrive, seq) not in current:
+        if (arrive, seq, exposure) not in current:
             continue  # 已被更优标签支配的过期堆项
         for eid in world.adjacency.get(node, ()):
             edge = world.edges[eid]
             if edge.dst in visited:
                 continue
-            entry = earliest_entry(edge, arrive, size, world, horizon,
-                                   use_closures=use_closures,
-                                   use_loads=use_loads)
+            entry = earliest_entry(
+                edge, arrive, size, world, horizon,
+                use_closures=use_closures, use_loads=use_loads,
+                smoke_budget=smoke_budget, smoke_used=exposure)
             if entry is None:
                 continue
             nxt_time = entry + edge.minutes
             nxt_seq = seq + (eid,)
             nxt_node = edge.dst
+            nxt_exposure = exposure + interval_exposure(
+                world.smoke_windows.get(eid, ()), entry, nxt_time)
 
             bucket = labels.setdefault(nxt_node, [])
             if any(_dominates(at2, sq2, nxt_time, nxt_seq)
-                   for at2, sq2 in bucket):
+                   and ex2 <= nxt_exposure
+                   for at2, sq2, ex2 in bucket):
                 continue
             # 移除被新标签支配的旧标签
-            bucket[:] = [(at2, sq2) for at2, sq2 in bucket
-                         if not _dominates(nxt_time, nxt_seq, at2, sq2)]
-            bucket.append((nxt_time, nxt_seq))
+            bucket[:] = [
+                (at2, sq2, ex2) for at2, sq2, ex2 in bucket
+                if not (_dominates(nxt_time, nxt_seq, at2, sq2)
+                        and nxt_exposure <= ex2)]
+            bucket.append((nxt_time, nxt_seq, nxt_exposure))
             if len(bucket) > MAX_LABELS_PER_NODE:
                 raise PlanningError(
                     f"节点 {nxt_node} 标签数超过上限 {MAX_LABELS_PER_NODE}")
             heapq.heappush(
                 heap,
-                (nxt_time, nxt_seq, nxt_node, visited | {nxt_node}))
+                (nxt_time, nxt_seq, nxt_node, nxt_exposure,
+                 visited | {nxt_node}))
 
-    result: dict[int, tuple[int, tuple[int, ...]]] = {}
+    result: dict[int, tuple[int, tuple[int, ...], int]] = {}
     for exit_id in world.exits:
         bucket = labels.get(exit_id)
         if bucket:
-            result[exit_id] = min(bucket)  # (到达, 通道序列)
+            # 最优 = (到达, 通道序列字典序, 累计暴露)
+            result[exit_id] = min(bucket, key=lambda lab: (lab[0], lab[1]))
     return result
 
 
-def _pick(best_by_exit: dict[int, tuple[int, tuple[int, ...]]]
-          ) -> Optional[tuple[int, int, tuple[int, ...]]]:
+def _pick(best_by_exit: dict[int, tuple[int, tuple[int, ...], int]]
+          ) -> Optional[tuple[int, int, tuple[int, ...], int]]:
     """跨出口按 (到达分钟, 出口编号, 通道序列) 取最优。"""
     if not best_by_exit:
         return None
-    exit_id, (arrive, seq) = min(
+    exit_id, (arrive, seq, exposure) = min(
         best_by_exit.items(), key=lambda kv: (kv[1][0], kv[0], kv[1][1]))
-    return arrive, exit_id, seq
+    return arrive, exit_id, seq, exposure
 
 
 def _walk_route(world: World, origin: int, size: int, start: int,
                 horizon: int, seq: tuple[int, ...], *,
-                use_closures: bool, use_loads: bool
-                ) -> tuple[list[dict], int, dict[tuple[int, int], int]]:
-    """按选定通道序列重放，得到每段进入/离开分钟与总负载增量。"""
+                use_closures: bool, use_loads: bool,
+                smoke_budget: int | None = None, smoke_used: int = 0
+                ) -> tuple[list[dict], int, dict[tuple[int, int], int], int]:
+    """按选定通道序列重放，得到每段进入/离开分钟、总负载增量与累计暴露。"""
     steps: list[dict] = []
     node = origin
     clock = start
+    exposure = smoke_used
     load_delta: dict[tuple[int, int], int] = {}
     for eid in seq:
         edge = world.edges[eid]
         entry = earliest_entry(edge, clock, size, world, horizon,
                                use_closures=use_closures,
-                               use_loads=use_loads)
+                               use_loads=use_loads,
+                               smoke_budget=smoke_budget,
+                               smoke_used=exposure)
         if entry is None or edge.src != node:
             raise PlanningError("路线重放失败")
         leave = entry + edge.minutes
+        exposure += interval_exposure(
+            world.smoke_windows.get(eid, ()), entry, leave)
         steps.append({
             "edge_id": eid,
             "from_node": edge.src,
@@ -231,16 +306,21 @@ def _walk_route(world: World, origin: int, size: int, start: int,
                 load_delta.get((eid, minute), 0) + size)
         node = edge.dst
         clock = leave
-    return steps, clock, load_delta
+    return steps, clock, load_delta, exposure
 
 
 def plan_group(*, group_id: int, size: int, origin: int,
                earliest_departure: int, deadline: int, current_minute: int,
-               world: World) -> dict:
+               world: World, smoke_limit: int | None = None,
+               initial_exposure: int = 0) -> dict:
     """为单个组规划，返回 scheduled / failed 结果。
 
     world.fixed_load 中应已包含此前已规划（同批高优先级）组的占用；
     调用方在拿到 scheduled 结果后须把 load_delta 累加进 fixed_load。
+
+    smoke_limit 为该组非负累计暴露上限（None 表示未设上限、不受约束）；
+    initial_exposure 为出发前已累计的暴露（节点滞留改编时为已走前缀按
+    原计划时刻计算的暴露），余程可用额度为 smoke_limit - initial_exposure。
     """
     start = max(current_minute, earliest_departure)
     if start > deadline:
@@ -251,15 +331,32 @@ def plan_group(*, group_id: int, size: int, origin: int,
             "detail": f"当前分钟 {current_minute} 已超过规划截止分钟 {deadline}",
         }
 
+    # 已走前缀按原计划时刻计算的暴露已超上限：任何余程（含零暴露）都无法
+    # 再满足约束（节点滞留改编保留前缀、只用剩余额度寻找余程）
+    if smoke_limit is not None and initial_exposure > smoke_limit:
+        return {
+            "group_id": group_id,
+            "status": "failed",
+            "reason": "BLOCKED_BY_SMOKE",
+            "detail": (
+                f"已走前缀累计烟雾暴露 {initial_exposure} 已超过该组上限 "
+                f"{smoke_limit}，没有可用的剩余暴露额度"),
+        }
+
+    remaining_budget = (
+        None if smoke_limit is None else smoke_limit - initial_exposure)
+
     # 1) 完整约束下寻路
     best = _search(world, origin=origin, size=size, start=start,
-                   horizon=deadline, use_closures=True, use_loads=True)
+                   horizon=deadline, use_closures=True, use_loads=True,
+                   smoke_budget=remaining_budget)
     picked = _pick(best)
     if picked is not None:
-        arrive, exit_id, seq = picked
-        steps, _, load_delta = _walk_route(
+        arrive, exit_id, seq, route_exposure = picked
+        steps, _, load_delta, total_exposure = _walk_route(
             world, origin, size, start, deadline, seq,
-            use_closures=True, use_loads=True)
+            use_closures=True, use_loads=True,
+            smoke_budget=remaining_budget, smoke_used=0)
         departure = steps[0]["enter_minute"] if steps else start
         return {
             "group_id": group_id,
@@ -269,15 +366,22 @@ def plan_group(*, group_id: int, size: int, origin: int,
             "arrival_minute": arrive,
             "steps": steps,
             "load_delta": load_delta,
+            "exposure": total_exposure,
         }
 
     # 2) 归因：分别放松单一约束
     relaxed_closure = _search(
         world, origin=origin, size=size, start=start,
-        horizon=deadline, use_closures=False, use_loads=True)
+        horizon=deadline, use_closures=False, use_loads=True,
+        smoke_budget=remaining_budget)
     relaxed_capacity = _search(
         world, origin=origin, size=size, start=start,
-        horizon=deadline, use_closures=True, use_loads=False)
+        horizon=deadline, use_closures=True, use_loads=False,
+        smoke_budget=remaining_budget)
+    relaxed_smoke = _search(
+        world, origin=origin, size=size, start=start,
+        horizon=deadline, use_closures=True, use_loads=True,
+        smoke_budget=None)
 
     if _pick(relaxed_closure) is not None:
         reason, detail = (
@@ -287,13 +391,18 @@ def plan_group(*, group_id: int, size: int, origin: int,
         reason, detail = (
             "INSUFFICIENT_CAPACITY",
             "忽略通道容量限制后可在截止前到达，容量竞争阻断了所有可行路线")
+    elif smoke_limit is not None and _pick(relaxed_smoke) is not None:
+        reason, detail = (
+            "BLOCKED_BY_SMOKE",
+            "忽略烟雾暴露上限后可在截止前到达，现有烟雾暴露时段使截止前"
+            "所有可行路线的累计暴露都超过该组上限")
     else:
         # 3) 完全放松（含时间窗），判断出口是否物理可达
         total_w = sum(e.minutes for e in world.edges.values())
         far_horizon = deadline + total_w + 1
         plain = _search(world, origin=origin, size=size, start=start,
                         horizon=far_horizon, use_closures=False,
-                        use_loads=False)
+                        use_loads=False, smoke_budget=None)
         if _pick(plain) is None:
             reason, detail = (
                 "UNREACHABLE_EXIT",
@@ -301,7 +410,7 @@ def plan_group(*, group_id: int, size: int, origin: int,
         else:
             reason, detail = (
                 "INSUFFICIENT_CAPACITY",
-                "封闭时段与通道容量共同阻断了截止前的所有可行路线")
+                "封闭时段、通道容量与烟雾暴露共同阻断了截止前的所有可行路线")
 
     return {
         "group_id": group_id,
