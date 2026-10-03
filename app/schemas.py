@@ -59,6 +59,55 @@ class CapacityControlListOut(BaseModel):
     controls: list[CapacityControlOut]
 
 
+# --------------------------------------------------------------------------
+# 烟雾暴露时段与累计暴露上限
+# --------------------------------------------------------------------------
+
+class SmokeWindowIn(BaseModel):
+    edge_id: int = Field(..., description="被登记烟雾暴露的通道编号")
+    start_minute: int = Field(..., ge=0, description="暴露开始分钟（含，须不早于当前分钟）")
+    end_minute: int = Field(..., ge=0, description="暴露结束分钟（不含）")
+    smoke_value: int = Field(
+        ..., ge=0, description="时段内每分钟暴露值（非负整数；未登记分钟为零）")
+
+    @model_validator(mode="after")
+    def _half_open(self):
+        if self.end_minute <= self.start_minute:
+            raise ValueError(
+                "烟雾暴露时段需为左闭右开：end_minute 必须大于 start_minute")
+        return self
+
+
+class SmokeWindowOut(BaseModel):
+    edge_id: int
+    start_minute: int
+    end_minute: int
+    smoke_value: int = Field(description="时段内每分钟暴露值")
+
+
+class SmokeWindowListOut(BaseModel):
+    current_minute: int
+    windows: list[SmokeWindowOut]
+
+
+class SmokeLimitIn(BaseModel):
+    """为尚未出发的人群组登记非负累计暴露上限（每组至多一项，再登记替换）。"""
+    group_id: int = Field(..., ge=1, description="人群组编号，须尚未出发")
+    smoke_limit: int = Field(
+        ..., ge=0,
+        description="非负累计暴露上限：沿路线逐分钟暴露值之和不得超过该值")
+
+
+class SmokeLimitOut(BaseModel):
+    group_id: int
+    smoke_limit: int = Field(description="非负累计暴露上限")
+
+
+class SmokeLimitListOut(BaseModel):
+    current_minute: int
+    groups: list[SmokeLimitOut]
+
+
 class DelayReportIn(BaseModel):
     """现场指挥对单个已出发组的节点滞留报告（组号取自路径参数）。"""
     node_id: int = Field(..., ge=0, description="组按现行计划已到达、当前滞留的节点编号")
@@ -457,6 +506,18 @@ class GroupPlanOut(BaseModel):
         None, description="非负放行间隔：最早放行=先导到达分钟+该间隔")
     release_basis: Optional[PrerequisiteBasisOut] = Field(
         None, description="当前放行依据：先导状态、采用的到达分钟与最早放行分钟")
+    # ---- 烟雾累计暴露（仅登记过非负暴露上限的组给出，其余恒为 null）----
+    smoke_exposure_limit: Optional[int] = Field(
+        None, description="该组登记的非负累计暴露上限（未设上限的组为 null）")
+    smoke_exposure_used: Optional[int] = Field(
+        None,
+        description="已走前缀按原计划时刻累计的烟雾暴露（未出发组为 0）；"
+                    "节点滞留改编时该部分保留、不计入余程额度")
+    smoke_exposure_remaining: Optional[int] = Field(
+        None,
+        description="余程（scheduled/fixed 含未来段；blocked/awaiting_rescue/"
+                    "rescuing/rescued 无余程）按现行计划时刻预计的累计烟雾暴露；"
+                    "无可行路线或无余程时为 null")
 
 
 class PlanResponse(BaseModel):

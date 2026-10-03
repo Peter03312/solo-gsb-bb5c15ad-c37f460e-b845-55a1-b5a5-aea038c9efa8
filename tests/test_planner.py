@@ -6,7 +6,7 @@ import pytest
 from app.planner import Edge, World, plan_group
 
 
-def build_world(edges, exits, closures=(), fixed_load=None):
+def build_world(edges, exits, closures=(), fixed_load=None, smoke=()):
     edge_map = {e.id: e for e in edges}
     adj: dict[int, list[int]] = {}
     for e in edges:
@@ -16,15 +16,21 @@ def build_world(edges, exits, closures=(), fixed_load=None):
     clo: dict[int, list[tuple[int, int]]] = {}
     for eid, a, b in closures:
         clo.setdefault(eid, []).append((a, b))
+    smk: dict[int, list[tuple[int, int, int]]] = {}
+    for eid, a, b, value in smoke:
+        smk.setdefault(eid, []).append((a, b, value))
     return World(edges=edge_map, adjacency=adj, exits=list(exits),
-                 closures=clo, fixed_load=dict(fixed_load or {}))
+                 closures=clo, fixed_load=dict(fixed_load or {}),
+                 smoke_windows=smk)
 
 
-def plan(world, gid=1, size=10, origin=1, earliest=0, deadline=100, now=0):
+def plan(world, gid=1, size=10, origin=1, earliest=0, deadline=100, now=0,
+         smoke_limit=None, exposure_used=0):
     return plan_group(
         group_id=gid, size=size, origin=origin,
         earliest_departure=earliest, deadline=deadline,
-        current_minute=now, world=world)
+        current_minute=now, world=world, smoke_limit=smoke_limit,
+        exposure_used=exposure_used)
 
 
 def test_simple_earliest_route():
@@ -240,3 +246,152 @@ def test_capacity_control_blocking_all_windows_reason():
     r = plan(world, size=6, deadline=10)
     assert r["status"] == "failed"
     assert r["reason"] == "INSUFFICIENT_CAPACITY"
+
+
+# --------------------------------------------------------------------------
+# 烟雾暴露：逐分钟累计、等待消散、累计上限与前缀额度
+# --------------------------------------------------------------------------
+
+def test_smoke_unlimited_group_takes_earliest():
+    world = build_world(
+        [Edge(1, 1, 2, 2, 100)], exits=[2],
+        smoke=[(1, 0, 10, 99)])
+    r = plan(world)  # 不设上限
+    assert r["status"] == "scheduled"
+    assert r["departure_minute"] == 0
+    assert r["arrival_minute"] == 2
+
+
+def test_smoke_wait_until_window_end_meets_limit():
+    # 通行2分钟，窗口[0,2) 每分钟5：t=0 进入暴露10超限；t=1 只占分钟1
+    # 暴露5。上限9 -> t=1 进入、到达3；上限4 -> 须等至 t=2 暴露0、到达4
+    world = build_world(
+        [Edge(1, 1, 2, 2, 100)], exits=[2],
+        smoke=[(1, 0, 2, 5)])
+    r = plan(world, smoke_limit=9)
+    assert r["status"] == "scheduled"
+    assert r["steps"][0]["enter_minute"] == 1
+    assert r["arrival_minute"] == 3
+    r2 = plan(world, smoke_limit=4)
+    assert r2["steps"][0]["enter_minute"] == 2
+    assert r2["arrival_minute"] == 4
+    # 上限5：t=1 暴露5恰好
+    r3 = plan(world, smoke_limit=5)
+    assert r3["steps"][0]["enter_minute"] == 1
+
+
+def test_smoke_limit_equal_to_immediate_exposure_allowed():
+    world = build_world(
+        [Edge(1, 1, 2, 2, 100)], exits=[2],
+        smoke=[(1, 0, 2, 5)])
+    r = plan(world, smoke_limit=10)
+    assert r["departure_minute"] == 0
+
+
+def test_smoke_zero_limit_waits_for_clearance():
+    world = build_world(
+        [Edge(1, 1, 2, 2, 100)], exits=[2],
+        smoke=[(1, 3, 6, 5)])
+    r = plan(world, smoke_limit=0)
+    # t=0 占用[0,2) 无烟，本可立即走；立即走到达2，与等待方案暴露同为0，
+    # 最早出发仍为0
+    assert r["departure_minute"] == 0
+
+
+def test_smoke_window_aligned_with_later_occupancy_forces_wait():
+    # t=0 占用[0,2) 无烟；但若封闭迫使第4分钟进入（占用[4,6)），
+    # 窗口[4,6) 值1、上限0 -> 等至第6分钟
+    world = build_world(
+        [Edge(1, 1, 2, 2, 100)], exits=[2],
+        closures=[(1, 0, 6)], smoke=[(1, 4, 6, 1)])
+    r = plan(world, smoke_limit=0)
+    assert r["steps"][0]["enter_minute"] == 6
+    assert r["arrival_minute"] == 8
+
+
+def test_smoke_partial_overlap_entry_minutes():
+    # w=4，窗口[2,4) 值1：t=0 占用0..3 暴露2；t=1 占用1..4 暴露2；
+    # t=2 占用2..5 暴露2；t=4 占用4..7 暴露0。上限0 -> t=4 进入
+    world = build_world(
+        [Edge(1, 1, 2, 4, 100)], exits=[2],
+        smoke=[(1, 2, 4, 1)])
+    r = plan(world, smoke_limit=0)
+    assert r["steps"][0]["enter_minute"] == 4
+
+
+def test_smoke_wait_beyond_deadline_fails_with_reason():
+    world = build_world(
+        [Edge(1, 1, 2, 2, 100)], exits=[2],
+        smoke=[(1, 0, 20, 1)])
+    r = plan(world, smoke_limit=0, deadline=10)
+    assert r["status"] == "failed"
+    assert r["reason"] == "EXPOSURE_LIMIT_EXCEEDED"
+
+
+def test_smoke_prefix_quota_used_in_replan():
+    # 节点滞留改编：已走前缀已用6，余程通道2 窗口[0,10) 每分钟3（2分钟
+    # =6），上限10 -> 立即续走 6+6>10；t=9 进入只占分钟9暴露3（6+3=9
+    # <=10）、到达11，早于等到窗口结束
+    world = build_world(
+        [Edge(2, 2, 5, 2, 100)], exits=[5],
+        smoke=[(2, 0, 10, 3)])
+    r = plan(world, origin=2, earliest=4, deadline=20,
+             smoke_limit=10, exposure_used=6)
+    assert r["status"] == "scheduled"
+    assert r["steps"][0]["enter_minute"] == 9
+    assert r["arrival_minute"] == 11
+
+
+def test_smoke_prefix_quota_no_remaining_route_fails():
+    world = build_world(
+        [Edge(2, 2, 5, 2, 100)], exits=[5],
+        smoke=[(2, 0, 20, 3)])
+    r = plan(world, origin=2, earliest=4, deadline=12,
+             smoke_limit=10, exposure_used=6)
+    # 等至第12分钟进入则到达14 > deadline12；任何更早进入都+6 超限
+    assert r["status"] == "failed"
+    assert r["reason"] == "EXPOSURE_LIMIT_EXCEEDED"
+
+
+def test_smoke_does_not_change_tiebreak_order_when_clear():
+    # 两条同到达路线都无烟时，通道序列字典序规则保持不变
+    world = build_world([
+        Edge(1, 1, 2, 3, 100), Edge(2, 2, 3, 3, 100),
+        Edge(9, 1, 3, 6, 100),
+    ], exits=[3], smoke=[(9, 0, 10, 5)])
+    # 通道9 有烟但组无上限：择优仍按到达/出口/序列 -> [1,2]
+    r = plan(world)
+    assert [s["edge_id"] for s in r["steps"]] == [1, 2]
+
+
+def test_smoke_multi_hop_accumulates_across_edges():
+    # P1 每分钟2（2分钟=4），P2 每分钟3（2分钟=6）：上限10 立即走=10 恰好
+    world = build_world(
+        [Edge(1, 1, 2, 2, 100), Edge(2, 2, 5, 2, 100)],
+        exits=[5], smoke=[(1, 0, 10, 2), (2, 0, 10, 3)])
+    r = plan(world, smoke_limit=10)
+    assert r["status"] == "scheduled"
+    assert r["arrival_minute"] == 4
+    # 上限9：P1 暴露4；P2 t=9 进入只占窗口分钟9（暴露3），4+3=9、
+    # 到达11（早于等至窗口结束 t=10 的到达12）
+    r2 = plan(world, smoke_limit=9)
+    assert r2["steps"][1]["enter_minute"] == 9
+    assert r2["arrival_minute"] == 11
+
+
+def test_smoke_zero_value_window_is_free():
+    world = build_world(
+        [Edge(1, 1, 2, 2, 100)], exits=[2],
+        smoke=[(1, 0, 10, 0)])
+    r = plan(world, smoke_limit=0)
+    assert r["departure_minute"] == 0
+
+
+def test_smoke_relaxed_search_ignores_limit_for_attribution():
+    # 烟雾是唯一阻断因素：忽略暴露上限后可到达 -> EXPOSURE_LIMIT_EXCEEDED
+    world = build_world(
+        [Edge(1, 1, 2, 2, 100), Edge(2, 2, 3, 1, 100)], exits=[3],
+        smoke=[(1, 0, 50, 1)])
+    r = plan(world, smoke_limit=0, deadline=10)
+    assert r["status"] == "failed"
+    assert r["reason"] == "EXPOSURE_LIMIT_EXCEEDED"

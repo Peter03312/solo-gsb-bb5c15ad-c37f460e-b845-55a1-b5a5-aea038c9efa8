@@ -531,6 +531,51 @@ if __name__ == "__main__":
     print("  失效留痕：", [(r["report_id"], r["seq"], r["detach_reason"])
                         for r in payload["detached_reports"]])
 
+    # ---- 烟雾暴露时段与累计暴露上限 ----
+    call("POST", "/scenario", {
+        "passages": [
+            {"id": 1, "src": 1, "dst": 2, "minutes": 4, "capacity": 30},
+            {"id": 2, "src": 2, "dst": 3, "minutes": 3, "capacity": 30},
+            {"id": 3, "src": 3, "dst": 5, "minutes": 2, "capacity": 30},
+            {"id": 5, "src": 2, "dst": 6, "minutes": 2, "capacity": 40},
+        ],
+        "exits": [5, 6], "closures": [],
+        "groups": [
+            {"id": 1, "size": 30, "origin": 1, "earliest_departure": 0,
+             "priority": 10, "deadline": 30},
+            {"id": 3, "size": 10, "origin": 2, "earliest_departure": 0,
+             "priority": 20, "deadline": 20}],
+    })
+    status, plan = call("POST", "/smoke-limits",
+                        {"group_id": 3, "smoke_limit": 3})
+    show("为组3登记累计暴露上限3", status, plan)
+    status, plan = call("POST", "/smoke-windows",
+                        {"edge_id": 5, "start_minute": 0,
+                         "end_minute": 2, "smoke_value": 5})
+    show("通道5 [0,2) 每分钟暴露5：组3等待烟雾消散，第2分钟进入", status, plan)
+    g3 = next(g for g in plan["groups"] if g["group_id"] == 3)
+    print("  组3 出发/到达：", g3["departure_minute"], g3["arrival_minute"],
+          " 上限/前缀已用/余程预计：", g3["smoke_exposure_limit"],
+          g3["smoke_exposure_used"], g3["smoke_exposure_remaining"])
+
+    show("烟雾时段列表", *call("GET", "/smoke-windows"))
+    show("各组暴露上限列表", *call("GET", "/smoke-limits"))
+    status, payload = call("POST", "/smoke-windows",
+                           {"edge_id": 5, "start_minute": 1,
+                            "end_minute": 3, "smoke_value": 1})
+    show("同通道时段重叠（预期 409 SMOKE_WINDOW_OVERLAP）", status, payload)
+
+    call("POST", "/tick", {"minutes": 1})  # 组3 fixed，通道5 剩余占用分钟1
+    status, payload = call("POST", "/smoke-windows",
+                           {"edge_id": 5, "start_minute": 1,
+                            "end_minute": 5, "smoke_value": 4})
+    show("新窗口使已出发组3预计暴露4>上限3（预期 409 整次拒绝）",
+         status, payload)
+    status, plan = call("POST", "/smoke-limits",
+                        {"group_id": 3, "smoke_limit": 99})
+    show("已出发组再登记上限（预期 409 SMOKE_LIMIT_TARGET_DEPARTED）",
+         status, plan)
+
     # ---- 修订历史：追溯每次编排变更 ----
     status, payload = call("GET", "/revisions")
     show("修订列表（每次成功变更一条，拒绝不产生）", status, payload)

@@ -52,6 +52,16 @@
   实绩时刻并按实绩汇总通道逐分钟人数，标出超当时有效容量或命中封闭的
   异常；偏离或超额只留痕，不反向修改编排、占用、封闭/管制与修订；场景
   重置清空本场全部实绩。
+* 现场可按通道登记烟雾暴露时段（通道号、起止分钟、每分钟非负暴露值；
+  时段自当前分钟起、同通道不重叠），并为尚未出发的组登记非负累计暴露
+  上限（每组一项、再登记替换，未设上限的组不受约束）。通道占用的每一
+  分钟计入该通道该分钟暴露值，未登记为零，节点等待不计；编排须在暴露
+  不超限的路线中沿用既有封闭、容量、截止、先导放行与路线择优规则，可在
+  节点等待烟雾消散后通行。暴露时段若使已出发且设限组按固定路线的预计
+  累计暴露超限，或暴露上限登记时目标组已出发，均整次拒绝、不改编排与
+  修订。节点滞留改编保留已走前缀按原计划时刻累计的暴露，只用剩余额度
+  寻找余程；无可行余程沿用待救援流程。编排查询展示各组上限、前缀已用
+  及余程预计暴露；场景重置清空本场全部烟雾暴露设置。
 
 修订历史
 ========
@@ -73,7 +83,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 
 from . import db
-from .planner import effective_capacity, plan_group
+from .planner import edge_traversal_exposure, effective_capacity, plan_group
 from .schemas import (CapacityControlIn, CapacityControlListOut,
                       CapacityControlOut, ClosureIn, ConflictOut,
                       DelayReportAliasIn, DelayReportIn,
@@ -88,6 +98,8 @@ from .schemas import (CapacityControlIn, CapacityControlListOut,
                       RescueTaskListOut, RescueTaskOut, RescueTeamIn,
                       RescueTeamListOut, RescueTeamOut, RevisionDetailOut,
                       RevisionListOut, RevisionSummaryOut, ScenarioIn,
+                      SmokeLimitIn, SmokeLimitListOut, SmokeLimitOut,
+                      SmokeWindowIn, SmokeWindowListOut, SmokeWindowOut,
                       StepOut, TraversalActualStepOut, TraversalEdgeMinuteOut,
                       TraversalGroupDetailOut, TraversalGroupOut,
                       TraversalReportIn, TraversalReportListOut,
@@ -123,10 +135,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="场馆疏散通道编排服务",
-    version="1.6.0",
+    version="1.7.0",
     description="按优先级逐组编排截止前最早到达的疏散路线，"
                 "支持封闭时段、容量管制时段、每分钟容量约束、增量重排、"
                 "先导组放行间隔（多级依赖按依赖顺序安排）、"
+                "按通道登记烟雾暴露时段与按组登记非负累计暴露上限"
+                "（可等待烟雾消散后通行、超限路线不可安排）、"
                 "现场节点滞留报告与人工救援队交接核销、"
                 "出口按组清点实际撤离人数（幂等登记、版本化更正），"
                 "以及已出发组逐段实际通行核报（顺序核报、幂等留痕、"
@@ -267,7 +281,8 @@ async def _replan_pending(conn: aiosqlite.Connection,
     写阶段整体置于一个事务中，杜绝部分重排。
     """
     minute_now = await db.get_current_minute(conn)
-    world, pending, prerequisites, db_states = await db.load_world(conn)
+    world, pending, prerequisites, db_states, smoke_limits = \
+        await db.load_world(conn)
 
     node_set: set[int] = set()
     for e in world.edges.values():
@@ -357,7 +372,8 @@ async def _replan_pending(conn: aiosqlite.Connection,
             result = plan_group(
                 group_id=g["id"], size=g["size"], origin=g["origin"],
                 earliest_departure=earliest,
-                deadline=g["deadline"], current_minute=minute_now, world=world)
+                deadline=g["deadline"], current_minute=minute_now, world=world,
+                smoke_limit=smoke_limits.get(g["id"]))
             results[g["id"]] = result
             if result["status"] == "scheduled":
                 states[g["id"]] = {
@@ -466,6 +482,11 @@ _RESCUE_DETAIL = {
         "标记待救援",
     "UNREACHABLE_EXIT":
         "滞留节点 {node} 与任何出口之间不存在连通路径，标记待救援",
+    "EXPOSURE_LIMIT_EXCEEDED":
+        "组自节点 {node} 第 {recovery} 分钟恢复：忽略烟雾累计暴露上限后"
+        "可在截止前到达，现有烟雾暴露时段使截止前全部余程（含等待烟雾"
+        "消散）的暴露超过剩余额度（上限 {limit}，已走前缀已用 {used}），"
+        "标记待救援",
 }
 
 
@@ -632,6 +653,17 @@ async def _apply_delay_report(conn: aiosqlite.Connection, *,
             k = (await cur.fetchone())[0]
 
     before = await _build_plan_response(conn)
+    smoke_map = await _load_smoke_map(conn)
+    smoke_limits = await db.load_smoke_limits(conn)
+    smoke_limit = smoke_limits.get(group_id)
+    # 已走前缀按原计划时刻累计的烟雾暴露（余程段即将被删除，先核算保留）
+    prefix_steps = []
+    async with conn.execute(
+            """SELECT edge_id, enter_minute, exit_minute FROM route_steps
+               WHERE group_id=? AND seq<? ORDER BY seq""",
+            (group_id, k)) as cur:
+        prefix_steps = await cur.fetchall()
+    exposure_used = _steps_exposure(smoke_map, prefix_steps)
     async with db.transaction(conn):
         # 1) 释放旧预约：删除当前分钟起的余程段，清除未来计划字段；
         #    组先置 fixed，使稍后 load_world 不把它计入待重排集合
@@ -650,7 +682,7 @@ async def _apply_delay_report(conn: aiosqlite.Connection, *,
 
         # 2) 以滞留节点为起点、恢复分钟为最早出发重找余程。此时 world 的
         #    固定占用含其他已出发组（本组旧余程已删除，不会重复计数）
-        world, _pending, _pre, _states = await db.load_world(conn)
+        world, _pending, _pre, _states, _limits = await db.load_world(conn)
         if recovery_minute > deadline:
             result = {
                 "group_id": group_id,
@@ -662,7 +694,8 @@ async def _apply_delay_report(conn: aiosqlite.Connection, *,
             result = plan_group(
                 group_id=group_id, size=size, origin=node_id,
                 earliest_departure=recovery_minute, deadline=deadline,
-                current_minute=minute_now, world=world)
+                current_minute=minute_now, world=world,
+                smoke_limit=smoke_limit, exposure_used=exposure_used)
 
         if result["status"] == "scheduled":
             arrival = result["arrival_minute"]
@@ -683,8 +716,12 @@ async def _apply_delay_report(conn: aiosqlite.Connection, *,
                      step["enter_minute"], step["exit_minute"]))
             outcome = "resumed"
         else:
-            detail = _RESCUE_DETAIL[result["reason"]].format(
-                node=node_id, recovery=recovery_minute, deadline=deadline)
+            format_kwargs = {"node": node_id, "recovery": recovery_minute,
+                             "deadline": deadline}
+            if result["reason"] == "EXPOSURE_LIMIT_EXCEEDED":
+                format_kwargs.update(
+                    limit=smoke_limit, used=exposure_used)
+            detail = _RESCUE_DETAIL[result["reason"]].format(**format_kwargs)
             await conn.execute(
                 """UPDATE groups SET status='awaiting_rescue',
                    arrival_minute=NULL, exit_id=NULL, fail_reason=?,
@@ -712,6 +749,42 @@ async def _apply_delay_report(conn: aiosqlite.Connection, *,
 
 
 # --------------------------------------------------------------------------
+# 烟雾暴露核算
+# --------------------------------------------------------------------------
+
+async def _load_smoke_map(conn: aiosqlite.Connection
+                          ) -> dict[int, list[tuple[int, int, int]]]:
+    """通道编号 -> 按开始分钟升序、互不重叠的烟雾暴露时段 [(a,b,值), ...]。"""
+    smoke_map: dict[int, list[tuple[int, int, int]]] = {}
+    for w in await db.load_smoke_windows(conn):
+        smoke_map.setdefault(w["edge_id"], []).append(
+            (w["start_minute"], w["end_minute"], w["smoke_value"]))
+    return smoke_map
+
+
+def _steps_exposure(smoke_map: dict[int, list[tuple[int, int, int]]],
+                    steps, *, lo: int | None = None,
+                    hi: int | None = None) -> int:
+    """逐段（edge_id, enter, exit 三元组序列）按给定分钟窗口累计烟雾暴露。
+
+    每段计入 [max(enter, lo), min(exit, hi)) 区间内逐分钟暴露值；lo/hi
+    缺省为整个通行区间。节点等待不在任何通道段上，自然不计。
+    """
+    total = 0
+    for edge_id, enter_m, exit_m in steps:
+        start = enter_m if lo is None else max(enter_m, lo)
+        end = exit_m if hi is None else min(exit_m, hi)
+        for minute in range(start, end):
+            for a, b, value in smoke_map.get(edge_id, ()):
+                if a > minute:
+                    break
+                if minute < b:
+                    total += value
+                    break
+    return total
+
+
+# --------------------------------------------------------------------------
 # 响应组装
 # --------------------------------------------------------------------------
 
@@ -720,6 +793,8 @@ async def _build_plan_response(conn: aiosqlite.Connection) -> PlanResponse:
     prefix_by_group = await db.load_delay_prefixes(conn)
     rescue_by_group = await db.load_group_rescue_map(conn)
     prerequisites = await db.load_prerequisites(conn)
+    smoke_limits = await db.load_smoke_limits(conn)
+    smoke_map = await _load_smoke_map(conn)
     async with conn.execute(
             """SELECT id, status, departure_minute, arrival_minute, exit_id,
                       fail_reason, fail_detail
@@ -730,10 +805,12 @@ async def _build_plan_response(conn: aiosqlite.Connection) -> PlanResponse:
     out = []
     for gid, status, dep, arr, exit_id, reason, detail in group_rows:
         steps = []
+        raw_steps = []
         async with conn.execute(
                 """SELECT edge_id, from_node, to_node, enter_minute, exit_minute
                    FROM route_steps WHERE group_id=? ORDER BY seq""", (gid,)) as sc:
             for row in await sc.fetchall():
+                raw_steps.append((row[0], row[3], row[4]))
                 steps.append(StepOut(
                     edge_id=row[0], from_node=row[1], to_node=row[2],
                     enter_minute=row[3], exit_minute=row[4]))
@@ -751,6 +828,21 @@ async def _build_plan_response(conn: aiosqlite.Connection) -> PlanResponse:
                     leader=pre["leader_group_id"],
                     leader_reason=_leader_fail_reason(
                         pre["leader_group_id"], group_index))
+        # 烟雾暴露展示：仅登记过非负上限的组给出。已走前缀按原计划时刻
+        # （[enter, min(exit, now))）计已用暴露；余程（[max(enter, now),
+        # exit)）给出预计暴露，无未来路线段时为 null。
+        smoke_used = smoke_remaining = None
+        smoke_limit = smoke_limits.get(gid)
+        if smoke_limit is not None:
+            smoke_used = _steps_exposure(
+                smoke_map, raw_steps, hi=minute_now)
+            remaining_steps = [
+                (eid, enter_m, exit_m)
+                for eid, enter_m, exit_m in raw_steps
+                if exit_m > minute_now]
+            smoke_remaining = (
+                _steps_exposure(smoke_map, remaining_steps, lo=minute_now)
+                if remaining_steps else None)
         out.append(GroupPlanOut(
             group_id=gid, status=status, exit_id=exit_id,
             departure_minute=dep, arrival_minute=arr,
@@ -763,7 +855,10 @@ async def _build_plan_response(conn: aiosqlite.Connection) -> PlanResponse:
             delivery_minute=rescue.get("delivery_minute"),
             leader_group_id=(pre or {}).get("leader_group_id"),
             release_gap=(pre or {}).get("release_gap"),
-            release_basis=basis))
+            release_basis=basis,
+            smoke_exposure_limit=smoke_limit,
+            smoke_exposure_used=smoke_used,
+            smoke_exposure_remaining=smoke_remaining))
     return PlanResponse(current_minute=minute_now, groups=out)
 
 
@@ -834,7 +929,9 @@ _GROUP_DIFF_FIELDS = ("status", "exit_id", "departure_minute",
                       "prefix_step_count", "reason", "detail",
                       "rescue_task_id", "rescue_team_id",
                       "rescued_exit_id", "delivery_minute",
-                      "leader_group_id", "release_gap", "release_basis")
+                      "leader_group_id", "release_gap", "release_basis",
+                      "smoke_exposure_limit", "smoke_exposure_used",
+                      "smoke_exposure_remaining")
 
 
 def _diff_plans(before: PlanResponse,
@@ -1170,6 +1267,256 @@ async def list_capacity_controls(request: Request):
         controls=[CapacityControlOut(
             edge_id=row[0], start_minute=row[1], end_minute=row[2],
             capacity=row[3]) for row in rows])
+
+
+# --------------------------------------------------------------------------
+# 烟雾暴露时段与累计暴露上限
+# --------------------------------------------------------------------------
+
+async def _smoke_window_conflicts(conn: aiosqlite.Connection,
+                                  smoke_map: dict,
+                                  smoke_limits: dict[int, int],
+                                  payload: SmokeWindowIn) -> list[dict]:
+    """新烟雾时段是否使已出发且设限组按固定路线的预计累计暴露超限。
+
+    已出发组（fixed）路线永久固定、不参与重排：把拟登记时段与既有时段
+    合并后，按其固定路线**全程**（含已走前缀，按原计划时刻）核算预计
+    累计暴露；已设非负上限且超限的组逐组列入冲突。待救援/救援中/已
+    救援组没有余程，新时段只能落在未来而其未来无路线占用，不受影响；
+    未出发组会随登记重排，不在检查之列。
+    """
+    eid = payload.edge_id
+    candidate = (payload.start_minute, payload.end_minute,
+                 payload.smoke_value)
+    conflicts: list[dict] = []
+    async with conn.execute(
+            """SELECT g.id
+               FROM groups g
+               WHERE g.status='fixed' AND EXISTS (
+                   SELECT 1 FROM route_steps rs
+                   WHERE rs.group_id=g.id AND rs.edge_id=?)
+               ORDER BY g.id""", (eid,)) as cur:
+        capped_fixed = [gid for (gid,) in await cur.fetchall()
+                        if gid in smoke_limits]
+    for gid in capped_fixed:
+        async with conn.execute(
+                """SELECT edge_id, enter_minute, exit_minute
+                   FROM route_steps WHERE group_id=? ORDER BY seq""",
+                (gid,)) as cur:
+            group_steps = await cur.fetchall()
+        projected = _steps_exposure(
+            _merged_smoke_map(smoke_map, {eid: [candidate]}),
+            group_steps)
+        limit = smoke_limits[gid]
+        if projected > limit:
+            # 仅拟登记时段本身落在该组路线上的逐分钟暴露增量，便于现场核对
+            added = 0
+            for step_eid, enter_m, exit_m in group_steps:
+                if step_eid != eid:
+                    continue
+                for minute in range(max(enter_m, payload.start_minute),
+                                    min(exit_m, payload.end_minute)):
+                    added += payload.smoke_value
+            conflicts.append({
+                "group_id": gid, "edge_id": eid,
+                "smoke_limit": limit,
+                "projected_exposure": projected,
+                "window_added_exposure": added,
+                "window": [payload.start_minute, payload.end_minute,
+                           payload.smoke_value]})
+    return conflicts
+
+
+def _merged_smoke_map(base: dict[int, list[tuple[int, int, int]]],
+                      extra: dict[int, list[tuple[int, int, int]]]
+                      ) -> dict[int, list[tuple[int, int, int]]]:
+    """合并既有烟雾时段与拟登记时段（调用前已保证互不重叠）。"""
+    merged: dict[int, list[tuple[int, int, int]]] = {
+        eid: list(segs) for eid, segs in base.items()}
+    for eid, segs in extra.items():
+        merged.setdefault(eid, []).extend(segs)
+        merged[eid].sort()
+    return merged
+
+
+@app.post("/smoke-windows", tags=["烟雾暴露"], response_model=PlanResponse,
+          status_code=201,
+          responses={
+              409: {"description": "同通道烟雾时段重叠，或新时段使已出发且"
+                                   "设限组按固定路线的预计累计暴露超限，整次拒绝"},
+              422: {"description": "通道不存在、起止无效、起点早于当前分钟或暴露值为负"}})
+async def add_smoke_window(payload: SmokeWindowIn, request: Request):
+    """现场按通道登记一条烟雾暴露时段。
+
+    时段为左闭右开 ``[start_minute, end_minute)``，起点须不早于当前分钟，
+    ``smoke_value`` 为时段内每分钟非负暴露值；同一通道的烟雾时段互不
+    重叠（端点相接允许）。通道占用的每分钟计入该分钟暴露值，未登记为
+    零，节点等待不计。通道不存在、起止无效或暴露值为负返回 422；与同
+    通道已有时段重叠返回 409 ``SMOKE_WINDOW_OVERLAP``。
+
+    若新时段使**已出发且设了非负累计暴露上限**的组按其固定路线的预计
+    累计暴露超限，整次拒绝（409
+    ``SMOKE_WINDOW_OVERLIMITS_DEPARTED_GROUP``，``conflicts`` 给出组号、
+    上限、预计累计暴露与该时段带来的增量暴露），不写入时段、不触发重排、
+    不产生修订。成功后仅重排未出发组（可在节点等待烟雾消散后通行；
+    已出发组路线保留），登记时段并产生一条 ``smoke-windows`` 修订。
+    """
+    conn = request.app.state.db
+    async with request.app.state.lock:
+        minute_now = await db.get_current_minute(conn)
+        async with conn.execute(
+                "SELECT 1 FROM edges WHERE id=?",
+                (payload.edge_id,)) as cur:
+            if await cur.fetchone() is None:
+                raise HTTPException(
+                    422, f"通道 {payload.edge_id} 不存在")
+        if payload.start_minute < minute_now:
+            raise HTTPException(
+                422, f"烟雾暴露起点 {payload.start_minute} 早于当前分钟 "
+                     f"{minute_now}")
+
+        smoke_map = await _load_smoke_map(conn)
+        overlaps = [(a, b, value)
+                    for a, b, value in smoke_map.get(payload.edge_id, ())
+                    if payload.start_minute < b
+                    and a < payload.end_minute]
+        if overlaps:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "SMOKE_WINDOW_OVERLAP",
+                    "message": "同一通道的烟雾暴露时段不得重叠，整次拒绝",
+                    "conflicts": [
+                        {"edge_id": payload.edge_id,
+                         "existing": [a, b, value],
+                         "requested": [payload.start_minute,
+                                       payload.end_minute,
+                                       payload.smoke_value]}
+                        for a, b, value in overlaps]})
+
+        smoke_limits = await db.load_smoke_limits(conn)
+        conflicts = await _smoke_window_conflicts(
+            conn, smoke_map, smoke_limits, payload)
+        if conflicts:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "SMOKE_WINDOW_OVERLIMITS_DEPARTED_GROUP",
+                    "message": "新烟雾暴露时段使已出发组按固定路线的预计"
+                               "累计暴露超过其登记上限，整次拒绝",
+                    "conflicts": conflicts})
+
+        before = await _build_plan_response(conn)
+        async with db.transaction(conn):
+            await db.insert_smoke_window(
+                conn, edge_id=payload.edge_id,
+                start_minute=payload.start_minute,
+                end_minute=payload.end_minute,
+                smoke_value=payload.smoke_value)
+            await _replan_pending(conn, in_transaction=True)
+            after = await _build_plan_response(conn)
+            await db.insert_revision(conn, "smoke-windows",
+                                     payload.model_dump(),
+                                     _plan_dump(before), _plan_dump(after))
+        return after
+
+
+@app.get("/smoke-windows", tags=["烟雾暴露"],
+         response_model=SmokeWindowListOut)
+async def list_smoke_windows(request: Request):
+    """列出当前全部烟雾暴露时段（按通道、开始分钟排序）。
+
+    场景重置会清空全部烟雾暴露时段；历史时段可通过修订快照追溯。
+    """
+    conn = request.app.state.db
+    async with request.app.state.lock:
+        minute_now = await db.get_current_minute(conn)
+        windows = await db.load_smoke_windows(conn)
+    return SmokeWindowListOut(
+        current_minute=minute_now,
+        windows=[SmokeWindowOut(**w) for w in windows])
+
+
+@app.post("/smoke-limits", tags=["烟雾暴露"], response_model=PlanResponse,
+          status_code=201,
+          responses={
+              409: {"description": "目标组已出发（fixed/awaiting_rescue/"
+                                   "rescuing/rescued），整次拒绝"},
+              422: {"description": "组不存在或暴露上限为负"}})
+async def register_smoke_limit(payload: SmokeLimitIn, request: Request):
+    """为**尚未出发**的人群组登记非负累计暴露上限。
+
+    每组至多一项：再次登记替换旧上限（修订 ``detail.replaced`` 记录被
+    替换的旧值）；未设上限的组不受烟雾暴露约束。通道占用的每分钟计入
+    该通道该分钟暴露值（未登记为零），节点等待不计；编排须在累计暴露
+    不超限的路线中沿用既有封闭、容量、截止、先导放行与路线择优规则，
+    可在节点等待烟雾消散后通行，截止前无满足上限的路线时该组失败
+    （``EXPOSURE_LIMIT_EXCEEDED`` 等既有归因）。
+
+    目标组已出发（含已被现场报告置为待救援、已交接救援队或已人工
+    送达）时整次拒绝（409 ``SMOKE_LIMIT_TARGET_DEPARTED``），旧上限、
+    编排与修订历史不变；组不存在或上限为负返回 422。成功登记原子重排
+    全部未出发组、写入一条 ``smoke-limits`` 修订，返回完整编排。
+    """
+    conn = request.app.state.db
+    async with request.app.state.lock:
+        minute_now = await db.get_current_minute(conn)
+        async with conn.execute(
+                "SELECT status FROM groups WHERE id=?",
+                (payload.group_id,)) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            raise HTTPException(
+                422, f"人群组 {payload.group_id} 不存在")
+        status = row[0]
+        if status in _DEPARTED_STATUSES:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "SMOKE_LIMIT_TARGET_DEPARTED",
+                    "message": "目标组已出发，累计暴露上限不可再登记，"
+                               "整次拒绝",
+                    "conflicts": [{
+                        "group_id": payload.group_id,
+                        "smoke_limit": payload.smoke_limit,
+                        "current_minute": minute_now,
+                        "status": status,
+                        "reason": "TARGET_ALREADY_DEPARTED"}]})
+
+        before = await _build_plan_response(conn)
+        old_limit = (await db.load_smoke_limits(conn)).get(payload.group_id)
+        async with db.transaction(conn):
+            await db.upsert_smoke_limit(
+                conn, group_id=payload.group_id,
+                smoke_limit=payload.smoke_limit)
+            await _replan_pending(conn, in_transaction=True)
+            after = await _build_plan_response(conn)
+            detail = {"group_id": payload.group_id,
+                      "smoke_limit": payload.smoke_limit}
+            if old_limit is not None:
+                detail["replaced"] = {"smoke_limit": old_limit}
+            await db.insert_revision(
+                conn, "smoke-limits", detail,
+                _plan_dump(before), _plan_dump(after))
+        return after
+
+
+@app.get("/smoke-limits", tags=["烟雾暴露"],
+         response_model=SmokeLimitListOut)
+async def list_smoke_limits(request: Request):
+    """列出当前各组登记的非负累计暴露上限（按组号升序）。
+
+    未列入响应的组即未设上限、不受烟雾暴露约束；各组前缀已用与余程
+    预计暴露见 ``GET /plan`` 中对应字段。场景重置清空全部上限。
+    """
+    conn = request.app.state.db
+    async with request.app.state.lock:
+        minute_now = await db.get_current_minute(conn)
+        smoke_limits = await db.load_smoke_limits(conn)
+    return SmokeLimitListOut(
+        current_minute=minute_now,
+        groups=[SmokeLimitOut(group_id=gid, smoke_limit=limit)
+                for gid, limit in sorted(smoke_limits.items())])
 
 
 # --------------------------------------------------------------------------

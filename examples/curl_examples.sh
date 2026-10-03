@@ -5,7 +5,9 @@
 # 重叠/超载拒绝、有效上限核验、组纠正、现场节点滞留报告（受理/拒绝/待救援）、
 # 人工救援队登记/派遣拒绝/派遣受理/结案核销、先导关系登记/替换/拒绝/前置
 # 未满足/多级依赖/人工送达锚点、出口清点（幂等登记/拒绝/更正/查询）、
-# 逐段实际通行核报（顺序核报/幂等/异常/滞留改编前缀保留/重置）、修订追溯。
+# 逐段实际通行核报（顺序核报/幂等/异常/滞留改编前缀保留/重置）、
+# 烟雾暴露时段与累计暴露上限（等待消散/重叠与超限拒绝/已出发保护/重置）、
+# 修订追溯。
 set -euo pipefail
 
 BASE="${1:-${BASE:-http://localhost:8000}}"
@@ -648,5 +650,75 @@ curl -s -X POST "$BASE/scenario" \
     ]
   }' > /dev/null
 curl -s "$BASE/traversal-reports" | python3 -m json.tool
+
+say "71) 烟雾暴露：重置双路场景，为组3（节点2）登记累计暴露上限 3"
+curl -s -X POST "$BASE/scenario" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "passages": [
+      {"id": 1, "src": 1, "dst": 2, "minutes": 4, "capacity": 30},
+      {"id": 2, "src": 2, "dst": 3, "minutes": 3, "capacity": 30},
+      {"id": 3, "src": 3, "dst": 5, "minutes": 2, "capacity": 30},
+      {"id": 5, "src": 2, "dst": 6, "minutes": 2, "capacity": 40}
+    ],
+    "exits": [5, 6],
+    "closures": [],
+    "groups": [
+      {"id": 1, "size": 30, "origin": 1, "earliest_departure": 0, "priority": 10, "deadline": 30},
+      {"id": 3, "size": 10, "origin": 2, "earliest_departure": 0, "priority": 20, "deadline": 20}
+    ]
+  }' > /dev/null
+curl -s -X POST "$BASE/smoke-limits" -H 'Content-Type: application/json' \
+  -d '{"group_id": 3, "smoke_limit": 3}' | python3 -m json.tool
+
+say "72) 通道5 第0..2分钟每分钟暴露5：立即通过累计10超上限，组3 等烟雾消散后第2分钟进入"
+curl -s -X POST "$BASE/smoke-windows" -H 'Content-Type: application/json' \
+  -d '{"edge_id": 5, "start_minute": 0, "end_minute": 2, "smoke_value": 5}' \
+  | python3 -m json.tool
+curl -s "$BASE/plan" | python3 -m json.tool
+
+say "73) 列出烟雾暴露时段与各组上限"
+curl -s "$BASE/smoke-windows" | python3 -m json.tool
+curl -s "$BASE/smoke-limits" | python3 -m json.tool
+
+say "74) 登记校验：同通道时段重叠 409；通道不存在/起止无效/负值 422；起点早于当前 422"
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' -X POST "$BASE/smoke-windows" \
+  -H 'Content-Type: application/json' \
+  -d '{"edge_id": 5, "start_minute": 1, "end_minute": 3, "smoke_value": 1}'
+python3 -m json.tool /tmp/resp.json || true
+curl -s -o /dev/null -w '未知通道 HTTP %{http_code}\n' -X POST "$BASE/smoke-windows" \
+  -H 'Content-Type: application/json' \
+  -d '{"edge_id": 999, "start_minute": 0, "end_minute": 2, "smoke_value": 1}'
+
+say "75) 推进1分钟后组3 fixed（通道5 占用[1,2)）：窗口[1,5)值4使其预计暴露4>上限3 -> 409 整次拒绝"
+curl -s -X POST "$BASE/tick" -H 'Content-Type: application/json' -d '{"minutes": 1}' > /dev/null
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' -X POST "$BASE/smoke-windows" \
+  -H 'Content-Type: application/json' \
+  -d '{"edge_id": 5, "start_minute": 1, "end_minute": 5, "smoke_value": 4}'
+python3 -m json.tool /tmp/resp.json || true
+# 值3恰好不超限 -> 受理；/plan 中前缀已用0、余程预计3
+curl -s -X POST "$BASE/smoke-windows" -H 'Content-Type: application/json' \
+  -d '{"edge_id": 5, "start_minute": 1, "end_minute": 5, "smoke_value": 3}' \
+  | python3 -m json.tool
+
+say "76) 已出发组再登记暴露上限 -> 409 SMOKE_LIMIT_TARGET_DEPARTED（整次拒绝）"
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' -X POST "$BASE/smoke-limits" \
+  -H 'Content-Type: application/json' \
+  -d '{"group_id": 3, "smoke_limit": 99}'
+python3 -m json.tool /tmp/resp.json || true
+
+say "77) 场景重置清空全部烟雾暴露时段与各组上限（旧修订保留）"
+curl -s -X POST "$BASE/scenario" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "passages": [{"id": 1, "src": 1, "dst": 6, "minutes": 2, "capacity": 20}],
+    "exits": [6],
+    "closures": [],
+    "groups": [
+      {"id": 1, "size": 10, "origin": 1, "earliest_departure": 0, "priority": 10, "deadline": 30}
+    ]
+  }' > /dev/null
+curl -s "$BASE/smoke-windows" | python3 -m json.tool
+curl -s "$BASE/smoke-limits" | python3 -m json.tool
 
 say "完成。交互文档： $BASE/docs"

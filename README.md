@@ -18,8 +18,13 @@
 支持现场为尚未出发的组登记**先导组与非负放行间隔**（每组至多一项、再次
 登记替换旧关系）：后继最早出发不早于自身最早出发与"先导规划到达+间隔"，
 先导已人工送达时改用实际送达分钟；先导待救援、救援中或无可行路线时后继
-
 标记**前置未满足**（不占通道），多级关系按依赖顺序安排。
+支持现场按通道登记**烟雾暴露时段**（通道号、起止分钟、每分钟非负暴露
+值，同通道不重叠），并为未出发组设定**非负累计暴露上限**（未设上限的组
+不受约束）：通道占用的每分钟计入该分钟暴露值（未登记为零、节点等待不
+计），编排只在暴露不超限的路线中沿用既有封闭、容量、截止、先导放行与
+路线择优规则，可在节点等待烟雾消散后通行；暴露时段若使已出发组按固定
+路线的预计累计暴露超限则整次拒绝。
 支持现场在出口按人群组**清点实际撤离人数**：每条清点凭非空唯一流水号
 幂等登记（同内容重试返回原记录、异内容拒绝），仅已按固定路线抵达该出口
 或已由人工救援实际送达该出口的组可登记，同组累计不超组人数；可凭原
@@ -81,13 +86,17 @@ EVAC_DB_PATH=./evacuation.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/health` | 健康检查，返回当前分钟 |
-| POST | `/scenario` | 全量重置场景（通道/出口/封闭/人群组），立即编排；同时清除全部容量管制、人工救援队与救援任务、先导关系与出口清点记录（旧修订保留） |
+| POST | `/scenario` | 全量重置场景（通道/出口/封闭/人群组），立即编排；同时清除全部容量管制、烟雾暴露时段与各组暴露上限、人工救援队与救援任务、先导关系与出口清点记录（旧修订保留） |
 | GET | `/plan` | 查询每组路线、出发/到达分钟或无法安排的原因 |
 | POST | `/groups` | 新增一组或多组，**仅重排未出发组** |
 | POST | `/group-corrections` | 批量纠正未出发组的属性（非空清单，整批原子生效）；目标组已出发则 **409 整批拒绝** |
 | POST | `/closures` | 新增左闭右开封闭时段；触及已出发组剩余路线则 **409 整次拒绝** |
 | POST | `/capacity-controls` | 登记左闭右开容量管制时段；重叠或使已出发组超载则 **409 整次拒绝** |
 | GET | `/capacity-controls` | 列出当前全部容量管制时段 |
+| POST | `/smoke-windows` | 登记左闭右开烟雾暴露时段（每分钟非负暴露值）；同通道重叠或使已出发且设限组预计累计暴露超限则 **409 整次拒绝** |
+| GET | `/smoke-windows` | 列出当前全部烟雾暴露时段 |
+| POST | `/smoke-limits` | 为未出发组登记非负累计暴露上限（每组一项，再登记替换）；目标已出发 **409**，编号或上限无效 **422** |
+| GET | `/smoke-limits` | 列出全部已登记的组暴露上限 |
 | POST | `/group-prerequisites` | 为未出发组登记先导组+非负放行间隔（每组一项，再登记替换）；目标已出发、自依赖/成环 **409**，编号或间隔无效 **422** |
 | GET | `/group-prerequisites` | 列出全部先导关系及实时放行依据（先导状态、采用的到达分钟、最早放行分钟） |
 | POST | `/groups/{group_id}/delay-report` | 现场报告已出发组在某节点滞留（按节点+恢复分钟重找余程）；组未出发、节点或时机不符 **409 整次拒绝** |
@@ -501,6 +510,7 @@ EVAC_DB_PATH=./evacuation.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 | --- | --- |
 | `BLOCKED_BY_CLOSURE` | 忽略封闭后可到达——封闭时段阻断了截止前所有路线 |
 | `INSUFFICIENT_CAPACITY` | 忽略容量后可到达（或单组人数超通道容量）——容量竞争阻断 |
+| `EXPOSURE_LIMIT_EXCEEDED` | 忽略烟雾累计暴露上限后可到达——现有烟雾暴露时段使截止前所有路线（含等待烟雾消散）累计暴露超限（节点滞留改编时为余程超过剩余额度） |
 | `UNREACHABLE_EXIT` | 起点与任何出口之间不存在连通路径 |
 | `DEADLINE_PASSED` | 当前分钟已超过该组规划截止分钟 |
 
@@ -554,6 +564,68 @@ EVAC_DB_PATH=./evacuation.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 登记成功后仅重排未出发组（已出发组路线与占用保留），返回重排后的
 完整编排（同 GET /plan）。
+
+**烟雾暴露时段 / 累计暴露上限**
+
+* `POST /smoke-windows` 登记一条按通道的烟雾暴露时段：
+
+  ```json
+  {"edge_id": 5, "start_minute": 0, "end_minute": 4, "smoke_value": 3}
+  ```
+
+  * 左闭右开 `[start_minute, end_minute)`，起点须不早于当前分钟、起点
+    早于终点；`smoke_value` 为时段内每分钟暴露值（**非负整数**）；
+  * 通道占用的每一分钟计入该通道该分钟暴露值，未登记的分钟为零，
+    **节点等待不计暴露**；同一通道的烟雾时段互不重叠（端点相接允许）；
+  * 编排须在累计暴露不超限的路线中沿用既有封闭、容量、截止、先导放行
+    与"最早到达/出口编号/通道序列"择优规则；可在节点等待烟雾消散后
+    通行，截止前无满足上限的路线时该组失败（原因码
+    `EXPOSURE_LIMIT_EXCEEDED`，忽略封闭/容量后仍不可达时沿用既有归因）；
+  * 通道不存在、起止无效、暴露值为负返回 **422**；同通道时段重叠返回
+    **409** `SMOKE_WINDOW_OVERLAP`；新时段使**已出发且设限**组按固定
+    路线的**预计累计暴露**超限（含已走前缀，按原计划时刻）返回 **409**
+    `SMOKE_WINDOW_OVERLIMITS_DEPARTED_GROUP`，`conflicts` 逐组给出组号、
+    上限、预计累计暴露与本时段增量暴露：
+
+    ```json
+    {
+      "error": "SMOKE_WINDOW_OVERLIMITS_DEPARTED_GROUP",
+      "message": "新烟雾暴露时段使已出发组按固定路线的预计累计暴露超过其登记上限，整次拒绝",
+      "conflicts": [
+        {"group_id": 3, "edge_id": 5, "smoke_limit": 3,
+         "projected_exposure": 4, "window_added_exposure": 4,
+         "window": [1, 5, 4]}
+      ]
+    }
+    ```
+
+  * 成功登记后仅重排未出发组（已出发组路线保留）并产生一条
+    `smoke-windows` 修订。`GET /smoke-windows` 按通道、开始分钟列出
+    全部时段。
+* `POST /smoke-limits` 为**尚未出发**的组登记非负累计暴露上限：
+
+  ```json
+  {"group_id": 3, "smoke_limit": 10}
+  ```
+
+  * 每组至多一项，再次登记**替换**旧值（修订 `detail.replaced` 记录被
+    替换的旧上限）；未设上限的组不受烟雾暴露约束；
+  * 目标组已出发（`fixed`/`awaiting_rescue`/`rescuing`/`rescued`）返回
+    **409** `SMOKE_LIMIT_TARGET_DEPARTED`（`reason=TARGET_ALREADY_DEPARTED`），
+    组不存在或上限为负返回 **422**；任何拒绝均整次不留状态、不产生修订；
+  * 成功登记原子重排全部未出发组并产生一条 `smoke-limits` 修订。
+    `GET /smoke-limits` 按组号列出全部已登记上限。
+* **节点滞留改编**保留已走前缀按原计划时刻计算的暴露（
+  `smoke_exposure_used`），只以**剩余额度**（上限 − 前缀已用）为余程
+  寻找可行路线；截止前无满足剩余额度的余程时沿用待救援流程（
+  `awaiting_rescue`，原因 `EXPOSURE_LIMIT_EXCEEDED`）。
+* **编排查询**（GET /plan）中，登记过上限的组额外给出：
+  `smoke_exposure_limit`（上限）、`smoke_exposure_used`（已走前缀按原
+  计划时刻的累计暴露，未出发组为 0）、`smoke_exposure_remaining`（余程
+  按现行计划时刻的预计累计暴露；无路线/无余程时为 `null`）；未设上限
+  的组三个字段恒为 `null`。
+* **场景重置**（POST /scenario）清空全部烟雾暴露时段与各组上限；旧
+  修订保留。
 
 **POST /group-prerequisites**：为**尚未出发**的人群组登记先导组与非负
 放行间隔。
@@ -637,9 +709,9 @@ EVAC_DB_PATH=./evacuation.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ### 修订历史（变更追溯）
 
-场景重置、新增人群组、纠正人群组、登记封闭、登记容量管制、**登记先导
-关系**、现场节点滞留报告、**人工救援派遣与结案核销**、时间推进**成功**
-时，各产生一条修订：
+场景重置、新增人群组、纠正人群组、登记封闭、登记容量管制、登记烟雾暴露
+时段与暴露上限、**登记先导关系**、现场节点滞留报告、**人工救援派遣与
+结案核销**、时间推进**成功**时，各产生一条修订：
 全局递增修订号（按实际提交顺序编号）、触发操作及参数摘要、提交后的当前
 分钟、提交前后完整编排快照。**被拒绝的请求（409/422）不产生修订。**修订
 和编排变更在同一 SQLite 事务提交，查询不会看到只写入一方的状态；场景
@@ -662,7 +734,8 @@ EVAC_DB_PATH=./evacuation.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 `operation`：`scenario`（场景重置）/ `groups`（新增人群组）/
 `group-corrections`（纠正人群组）/ `closures`（登记封闭）/
-`capacity-controls`（登记容量管制）/
+`capacity-controls`（登记容量管制）/ `smoke-windows`（登记烟雾暴露时段）/
+`smoke-limits`（登记/替换组暴露上限）/
 `group-prerequisites`（登记先导关系）/ `delay-reports`（现场节点滞留
 报告）/ `rescue-dispatches`（人工救援派遣）/
 `rescue-completions`（救援结案核销）/ `tick`（时间推进）。
@@ -704,8 +777,10 @@ EVAC_DB_PATH=./evacuation.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 （移除，`after` 为 null）/ `changed`（`changed_fields` 列出变化的字段，
 `before`/`after` 给出状态、出发与到达分钟、路线、逐段时刻、已走前缀步数
 `prefix_step_count`、失败原因、人工救援字段
-`rescue_task_id/rescue_team_id/rescued_exit_id/delivery_minute` 及先导
-关系字段 `leader_group_id/release_gap/release_basis` 的前后完整值）。
+`rescue_task_id/rescue_team_id/rescued_exit_id/delivery_minute`、先导
+关系字段 `leader_group_id/release_gap/release_basis` 及烟雾暴露字段
+`smoke_exposure_limit/smoke_exposure_used/smoke_exposure_remaining`
+的前后完整值）。
 未知修订号返回 HTTP 404 `{"detail": "修订号 N 不存在"}`。
 
 ## 4. 调用示例
@@ -732,6 +807,20 @@ curl -s -X POST http://localhost:8000/tick \
 curl -s -X POST http://localhost:8000/capacity-controls \
   -H 'Content-Type: application/json' \
   -d '{"edge_id": 1, "start_minute": 10, "end_minute": 14, "capacity": 10}'
+
+# 登记烟雾暴露时段：通道 1 第 0..4 分钟每分钟暴露值 3
+curl -s -X POST http://localhost:8000/smoke-windows \
+  -H 'Content-Type: application/json' \
+  -d '{"edge_id": 1, "start_minute": 0, "end_minute": 4, "smoke_value": 3}'
+
+# 为组 1 设定非负累计暴露上限 10（可在节点等待烟雾消散后通行）
+curl -s -X POST http://localhost:8000/smoke-limits \
+  -H 'Content-Type: application/json' \
+  -d '{"group_id": 1, "smoke_limit": 10}' | python3 -m json.tool
+
+# 查询各通道烟雾时段与各组上限；/plan 中另给出前缀已用与余程预计暴露
+curl -s http://localhost:8000/smoke-windows | python3 -m json.tool
+curl -s http://localhost:8000/smoke-limits | python3 -m json.tool
 
 # 查看通道 1 逐分钟占用与各分钟有效上限
 curl -s http://localhost:8000/passages/1/load | python3 -m json.tool
@@ -824,12 +913,12 @@ curl -s http://localhost:8000/exit-counts/1 | python3 -m json.tool
    清除全部管制记录。
 11. **并发**：全部变更接口由同一把异步互斥锁串行化，容量逐组累加校验，
     并发变更不会超用容量。
-12. **修订**：十类变更（场景重置/新增组/纠正组/登记封闭/登记容量管制/
-    登记先导关系/现场节点滞留报告/人工救援派遣/救援结案核销/推进时间）
-    成功时，在同一事务内追加修订记录（全局递增修订号、触发操作、当时
-    分钟、前后完整编排快照）；被拒绝的请求不产生修订，救援队登记也不
-    产生修订。修订不随场景重置或服务重启丢失，历史快照按落库内容原样
-    返回，不按当前场景重算。
+12. **修订**：各类变更（场景重置/新增组/纠正组/登记封闭/登记容量管制/
+    登记烟雾暴露时段/登记组暴露上限/登记先导关系/现场节点滞留报告/
+    人工救援派遣/救援结案核销/推进时间）成功时，在同一事务内追加修订
+    记录（全局递增修订号、触发操作、当时分钟、前后完整编排快照）；被
+    拒绝的请求不产生修订，救援队登记也不产生修订。修订不随场景重置或
+    服务重启丢失，历史快照按落库内容原样返回，不按当前场景重算。
 13. **现场节点滞留报告**：仅当该组按现行计划已到达所报节点、尚未进入
     下一通道且未抵达出口时受理（下一通道进入分钟 == 当前分钟仍视为在
     节点；恢复分钟不得早于当前分钟）；组未出发、节点或时机不符一律拒绝
@@ -899,18 +988,32 @@ curl -s http://localhost:8000/exit-counts/1 | python3 -m json.tool
     与封闭标 `OVER_CAPACITY`/`CLOSED` 异常。实绩偏离、命中封闭或超额均
     如实留痕，**不**反向修改编排、通道占用、封闭/管制或修订；受理与时间
     推进、改编共用同一把互斥锁、保持一致视图；场景重置清空本场全部实绩。
+18. **烟雾暴露**：现场可按通道登记左闭右开烟雾暴露时段（自当前分钟起、
+    起点早于终点、每分钟暴露值非负、同通道不重叠），通道占用的每分钟
+    计入该通道该分钟暴露值，未登记为零，节点等待不计。可为尚未出发的
+    组登记非负累计暴露上限（每组一项、再登记替换，未设上限不受约束）。
+    编排须在暴露不超限的路线中沿用既有封闭、容量、截止、先导放行与
+    "最早到达/出口编号/通道序列"择优规则，可在节点等待烟雾消散后通行，
+    截止前无满足上限的路线失败（`EXPOSURE_LIMIT_EXCEEDED`）。登记时段
+    若使已出发且设限组按固定路线的预计累计暴露（含已走前缀，按原计划
+    时刻）超限，或登记上限时目标组已出发，均整次拒绝（409）、不改编排
+    与修订；无效输入整次拒绝（422）且不留部分状态。节点滞留改编保留
+    已走前缀按原计划时刻累计的暴露，只用剩余额度（上限减去前缀已用）
+    寻找余程，无可行余程置待救援（沿用待救援流程）。编排查询展示各组
+    上限、前缀已用与余程预计暴露。成功的时段/上限登记各产生一条修订；
+    场景重置清空本场全部烟雾暴露设置。
 
 ## 6. 项目结构
 
 ```
 app/
-  main.py       FastAPI 路由、事务/互斥、增量重排（含先导依赖多轮安排）与拒绝逻辑、先导关系登记/查询、现场滞留报告、人工救援队派遣/结案、出口清点登记/更正/查询、逐段实际通行核报与实绩异常汇总、修订记录与差异
-  planner.py    编排核心：时变 FIFO 多标签最短路 + 容量/封闭可行性
-  db.py         SQLite 建表、世界状态加载、整组事务化持久化、先导关系/滞留报告/出口清点与修订落库
+  main.py       FastAPI 路由、事务/互斥、增量重排（含先导依赖多轮安排）与拒绝逻辑、烟雾暴露时段/上限登记与已出发组超限校验、先导关系登记/查询、现场滞留报告（保留前缀暴露、剩余额度寻余程）、人工救援队派遣/结案、出口清点登记/更正/查询、逐段实际通行核报与实绩异常汇总、修订记录与差异
+  planner.py    编排核心：时变 FIFO 多标签最短路（累计暴露标签与等待烟雾消散候选）+ 容量/封闭/暴露上限可行性
+  db.py         SQLite 建表、世界状态加载、整组事务化持久化、烟雾时段/上限、先导关系/滞留报告/出口清点与修订落库
   schemas.py    Pydantic 输入/输出模型
   seed.py       启动演示数据
 examples/       curl 与 Python 调用示例
-tests/          算法单元测试与 API/并发/修订历史/先导关系/出口清点/逐段通行核报集成测试（pytest）
+tests/          算法单元测试与 API/并发/修订历史/先导关系/烟雾暴露/出口清点/逐段通行核报集成测试（pytest）
 ```
 
 本地运行测试：
